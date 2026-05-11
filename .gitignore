@@ -1,0 +1,18 @@
+# Environment / secrets
+.env
+gcp-oauth.keys.json
+.gcal-tokens.json
+
+# Personal system prompt (contains personal rules/URLs – keep local)
+system_prompt.txt
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
