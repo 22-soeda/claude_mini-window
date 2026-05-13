@@ -59,6 +59,7 @@ async function initMCPServer(name, command, args, envVars) {
 
     const { tools = [] } = await client.listTools()
     console.log(`[MCP] ${name}: ${tools.length} tools loaded`)
+    console.log(`[MCP] ${name} tool names:`, tools.map(t => t.name).join(', '))
 
     return tools.map(tool => {
       const prefixedName = `${name}__${tool.name}`
@@ -164,7 +165,7 @@ async function initMCP() {
     const cmd  = process.env.NOTION_MCP_COMMAND || 'npx'
     const args = process.env.NOTION_MCP_ARGS
       ? process.env.NOTION_MCP_ARGS.split(' ')
-      : ['-y', '@notionhq/notion-mcp-server']
+      : ['-y', '@notionhq/notion-mcp-server@1.9.1']
 
     const notionTools = await initMCPServer('notion', cmd, args, {
       OPENAPI_MCP_HEADERS: JSON.stringify({
@@ -204,10 +205,20 @@ async function executeMCPTool(toolName, toolInput) {
   const client = mcpClients.get(entry.clientName)
   if (!client) throw new Error(`MCP client not available: ${entry.clientName}`)
 
+  console.log(`[MCP] calling tool "${entry.originalName}" (${entry.clientName}) with:`, JSON.stringify(toolInput).slice(0, 200))
+
   const result = await client.callTool({
     name:      entry.originalName,
     arguments: toolInput || {}
   })
+
+  if (result.isError) {
+    const errText = Array.isArray(result.content)
+      ? result.content.map(c => c.type === 'text' ? c.text : JSON.stringify(c)).join('\n')
+      : JSON.stringify(result)
+    console.error(`[MCP] tool "${entry.originalName}" returned an error:`, errText.slice(0, 500))
+    return errText
+  }
 
   if (Array.isArray(result.content)) {
     return result.content
@@ -260,8 +271,14 @@ async function handleChat(win, userMessage) {
   const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6'
 
   let continueLoop = true
+  let isFirstRound = true
 
   while (continueLoop) {
+    if (!isFirstRound) {
+      win.webContents.send('new-message')
+    }
+    isFirstRound = false
+
     const params = {
       model,
       max_tokens: 4096,
@@ -272,9 +289,6 @@ async function handleChat(win, userMessage) {
 
     try {
       const stream = anthropic.messages.stream(params)
-
-      // Signal renderer to prepare a new assistant bubble
-      win.webContents.send('new-message')
 
       for await (const event of stream) {
         if (
@@ -300,33 +314,40 @@ async function handleChat(win, userMessage) {
 
       // Execute all requested tools
       const toolResults = []
+      let lastServerName = ''
 
       for (const block of toolUseBlocks) {
         const entry = toolRegistry.get(block.name)
+        const serverName = entry ? entry.clientName : ''
+        if (serverName) lastServerName = serverName
         win.webContents.send('tool-status', {
           running:    true,
           name:       entry ? entry.displayName : block.name,
-          serverName: entry ? entry.clientName : ''
+          serverName
         })
 
         try {
           const content = await executeMCPTool(block.name, block.input)
+          console.log(`[MCP] tool result for "${block.name}":`, content.slice(0, 300))
           toolResults.push({
             type:        'tool_result',
             tool_use_id: block.id,
             content
           })
         } catch (err) {
+          const errMsg = err.message || String(err)
+          console.error(`[MCP] tool execution error for "${block.name}":`, err)
+          win.webContents.send('tool-debug', `[${entry?.clientName ?? block.name}] ${errMsg}`)
           toolResults.push({
             type:        'tool_result',
             tool_use_id: block.id,
-            content:     `Error: ${err.message}`,
+            content:     `Error: ${errMsg}`,
             is_error:    true
           })
         }
       }
 
-      win.webContents.send('tool-status', { running: false })
+      win.webContents.send('tool-status', { running: false, lastServerName })
 
       conversationHistory.push({ role: 'user', content: toolResults })
       // Loop continues → send tool results back to Claude
@@ -344,17 +365,18 @@ function createWindow() {
   const { width } = screen.getPrimaryDisplay().workAreaSize
 
   mainWindow = new BrowserWindow({
-    width:       600,
-    height:      500,
-    x:           Math.floor((width - 600) / 2),
-    y:           80,
-    frame:       false,
-    transparent: true,
-    backgroundColor: '#00000000',
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable:   false,
-    show:        false,
+    width:          600,
+    height:         500,
+    minWidth:       360,
+    minHeight:      280,
+    x:              Math.floor((width - 600) / 2),
+    y:              80,
+    titleBarStyle:  'hidden',   // タイトルバーを非表示にしつつ OS のリサイズ枠を保持
+    backgroundColor: '#FCFCFF',
+    alwaysOnTop:    true,
+    skipTaskbar:    true,
+    resizable:      true,
+    show:           false,
     webPreferences: {
       nodeIntegration:  false,
       contextIsolation: true,
@@ -363,6 +385,11 @@ function createWindow() {
   })
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'))
+
+  mainWindow.on('maximize',   () => sendMaximizeState())
+  mainWindow.on('unmaximize', () => sendMaximizeState())
+  mainWindow.on('enter-full-screen', () => sendMaximizeState())
+  mainWindow.on('leave-full-screen', () => sendMaximizeState())
 
   // Hide when focus leaves the window
   mainWindow.on('blur', () => {
@@ -386,6 +413,34 @@ ipcMain.on('send-message', async (event, message) => {
 ipcMain.on('window:minimize', () => mainWindow?.minimize())
 ipcMain.on('window:close',    () => mainWindow?.hide())
 
+ipcMain.handle('window:get-bounds', () => mainWindow?.getBounds() ?? null)
+
+ipcMain.on('window:set-bounds', (_, bounds) => {
+  if (!mainWindow) return
+  mainWindow.setBounds({
+    x:      Math.round(bounds.x),
+    y:      Math.round(bounds.y),
+    width:  Math.round(bounds.width),
+    height: Math.round(bounds.height)
+  })
+})
+
+ipcMain.on('window:maximize', () => {
+  if (!mainWindow) return
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize()
+  } else {
+    mainWindow.maximize()
+  }
+})
+
+// Notify renderer when maximize state changes
+function sendMaximizeState() {
+  if (mainWindow) {
+    mainWindow.webContents.send('maximize-change', mainWindow.isMaximized())
+  }
+}
+
 ipcMain.on('window:new-chat', () => {
   conversationHistory.length = 0
   mainWindow?.webContents.send('chat-cleared')
@@ -398,6 +453,8 @@ app.whenReady().then(async () => {
   app.setLoginItemSettings({
     openAtLogin: true,
     openAsHidden: true,
+    path: process.execPath,
+    args: [`"${app.getAppPath()}"`]
   })
 
   anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })

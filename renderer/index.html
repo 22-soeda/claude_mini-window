@@ -26,6 +26,11 @@
         <button id="btn-min" title="最小化">
           <svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></svg>
         </button>
+        <!-- 最大化 / 元に戻す -->
+        <button id="btn-max" title="最大化">
+          <svg id="icon-maximize" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+          <svg id="icon-restore"  viewBox="0 0 24 24" style="display:none"><rect x="7" y="4" width="13" height="13" rx="1.5"/><path d="M4 7v10a3 3 0 0 0 3 3h10"/></svg>
+        </button>
         <!-- 閉じる -->
         <button id="btn-close" title="閉じる">
           <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -52,6 +57,7 @@
     </div>
 
   </div>
+  <script src="../node_modules/marked/lib/marked.umd.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

@@ -1,16 +1,24 @@
 'use strict'
 
-const messagesEl = document.getElementById('messages')
-const chatAreaEl = document.getElementById('chat-area')
-const inputEl    = document.getElementById('input')
-const sendBtn    = document.getElementById('btn-send')
-const btnNew     = document.getElementById('btn-new')
-const btnMin     = document.getElementById('btn-min')
-const btnClose   = document.getElementById('btn-close')
+const messagesEl   = document.getElementById('messages')
+const chatAreaEl   = document.getElementById('chat-area')
+const inputEl      = document.getElementById('input')
+const sendBtn      = document.getElementById('btn-send')
+const btnNew       = document.getElementById('btn-new')
+const btnMin       = document.getElementById('btn-min')
+const btnMax       = document.getElementById('btn-max')
+const btnClose     = document.getElementById('btn-close')
+const iconMaximize = document.getElementById('icon-maximize')
+const iconRestore  = document.getElementById('icon-restore')
 
-let isLoading = false
+let isLoading    = false
 let currentBubble  = null   // streaming assistant bubble
+let currentRawText = ''     // raw markdown text for current bubble
 let toolStatusEl   = null   // active tool-status element
+let thinkingEl     = null   // thinking indicator element
+
+// Configure marked
+marked.setOptions({ breaks: true, gfm: true })
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -75,13 +83,36 @@ function removeToolStatus() {
   if (toolStatusEl) { toolStatusEl.remove(); toolStatusEl = null }
 }
 
+const SERVER_LABEL = { notion: 'Notion', gcal: 'Googleカレンダー' }
+
+function showThinking(label = '考え中') {
+  removeThinking()
+  thinkingEl = document.createElement('div')
+  thinkingEl.className = 'thinking'
+  thinkingEl.innerHTML =
+    `<span class="thinking-dots"><i></i><i></i><i></i></span>` +
+    `<span class="thinking-label">${label}</span>`
+  messagesEl.appendChild(thinkingEl)
+  scrollToBottom()
+}
+
+function updateThinkingLabel(label) {
+  if (!thinkingEl) return
+  const el = thinkingEl.querySelector('.thinking-label')
+  if (el) el.textContent = label
+}
+
+function removeThinking() {
+  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null }
+}
+
 function showToolStatus(name, serverName) {
   removeToolStatus()
   const icon = serverName === 'notion' ? '📝' : serverName === 'gcal' ? '📅' : '🔧'
   toolStatusEl = document.createElement('div')
   toolStatusEl.className = 'tool-status'
   toolStatusEl.innerHTML =
-    `<span class="ts-icon">${icon}</span><span>ツール実行中: ${name}</span>`
+    `<span class="ts-icon">${icon}</span><span>${name}</span>`
   messagesEl.appendChild(toolStatusEl)
   scrollToBottom()
 }
@@ -96,11 +127,15 @@ function showError(msg) {
 }
 
 function setLoading(loading) {
-  isLoading      = loading
+  isLoading        = loading
   sendBtn.disabled = loading
   inputEl.disabled = loading
-  sendBtn.textContent = loading ? '送信中…' : '送信'
   if (!loading) inputEl.focus()
+}
+
+// Render accumulated markdown into bubble
+function renderMarkdown(bubble, raw) {
+  bubble.innerHTML = marked.parse(raw)
 }
 
 // ── Send message ──────────────────────────────────────────────────────────
@@ -114,8 +149,10 @@ function sendMessage() {
 
   inputEl.value = ''
   inputEl.style.height = 'auto'
-  currentBubble = null
+  currentBubble  = null
+  currentRawText = ''
   setLoading(true)
+  showThinking('考え中')
 
   window.api.sendMessage(text)
 }
@@ -131,20 +168,30 @@ inputEl.addEventListener('keydown', e => {
   }
 })
 
-// Auto-resize textarea
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto'
   inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px'
 })
 
-// Esc hides window
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') window.api.closeWindow()
+  if (e.key === 'n' && (e.ctrlKey || e.metaKey) && !isLoading) {
+    e.preventDefault()
+    window.api.newChat()
+  }
 })
 
 btnNew.addEventListener('click',   () => { if (!isLoading) window.api.newChat() })
 btnMin.addEventListener('click',   () => window.api.minimizeWindow())
+btnMax.addEventListener('click',   () => window.api.maximizeWindow())
 btnClose.addEventListener('click', () => window.api.closeWindow())
+
+function applyMaximizeState(isMaximized) {
+  document.body.classList.toggle('maximized', isMaximized)
+  iconMaximize.style.display = isMaximized ? 'none' : ''
+  iconRestore.style.display  = isMaximized ? ''     : 'none'
+  btnMax.title = isMaximized ? '元のサイズに戻す' : '最大化'
+}
 
 // ── IPC event handlers ────────────────────────────────────────────────────
 
@@ -153,50 +200,83 @@ window.api.onWindowShown(() => {
 })
 
 window.api.onNewMessage(() => {
-  // Prepare a fresh assistant bubble for the upcoming stream
   removeToolStatus()
-  currentBubble = createMessageBubble('assistant')
-  currentBubble.classList.add('streaming')
+  currentBubble  = null
+  currentRawText = ''
+  showThinking('考え中')
 })
 
 window.api.onChunk(text => {
   if (!currentBubble) {
+    removeThinking()
     removeToolStatus()
-    currentBubble = createMessageBubble('assistant')
+    currentBubble  = createMessageBubble('assistant')
+    currentRawText = ''
     currentBubble.classList.add('streaming')
   }
-  currentBubble.textContent += text
+  currentRawText += text
+  renderMarkdown(currentBubble, currentRawText)
   scrollToBottom()
 })
 
 window.api.onToolStatus(status => {
   if (status.running) {
-    // Remove streaming cursor while tool runs
-    if (currentBubble) currentBubble.classList.remove('streaming')
+    removeThinking()
+    if (currentBubble) {
+      // Finalize markdown before switching to tool mode
+      renderMarkdown(currentBubble, currentRawText)
+      currentBubble.classList.remove('streaming')
+    }
     showToolStatus(status.name, status.serverName)
   } else {
     removeToolStatus()
+    const svrLabel = SERVER_LABEL[status.lastServerName] || status.lastServerName || ''
+    showThinking(svrLabel ? `${svrLabel}の結果を分析中` : '回答を生成中')
   }
 })
 
 window.api.onError(msg => {
-  if (currentBubble) currentBubble.classList.remove('streaming')
+  removeThinking()
+  if (currentBubble) {
+    renderMarkdown(currentBubble, currentRawText)
+    currentBubble.classList.remove('streaming')
+  }
   showError(msg)
   setLoading(false)
-  currentBubble = null
+  currentBubble  = null
+  currentRawText = ''
 })
 
 window.api.onComplete(() => {
-  if (currentBubble) currentBubble.classList.remove('streaming')
+  removeThinking()
+  if (currentBubble) {
+    renderMarkdown(currentBubble, currentRawText)
+    currentBubble.classList.remove('streaming')
+  }
   removeToolStatus()
   setLoading(false)
-  currentBubble = null
+  currentBubble  = null
+  currentRawText = ''
 })
 
 window.api.onChatCleared(() => {
-  currentBubble = null
-  toolStatusEl  = null
+  currentBubble  = null
+  currentRawText = ''
+  toolStatusEl   = null
+  thinkingEl     = null
   showEmptyState()
+})
+
+window.api.onMaximizeChange(isMaximized => {
+  applyMaximizeState(isMaximized)
+})
+
+window.api.onToolDebug(msg => {
+  const el = document.createElement('div')
+  el.className = 'tool-debug'
+  el.textContent = `🔍 ${msg}`
+  messagesEl.appendChild(el)
+  scrollToBottom()
 })
 
 // ── Init ──────────────────────────────────────────────────────────────────
